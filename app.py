@@ -1,5 +1,5 @@
 """
-Stock Research Lab v3 — swing-trading research prototype (India first, USA second).
+Stock Research Lab v3.1 — swing-trading research prototype (India first, USA second).
 
 Educational research tool. NOT investment advice. No signal guarantees profit.
 
@@ -15,8 +15,15 @@ What is new in v3
 * In-sample vs out-of-sample reporting, per-stock table, calendar-year table, benchmark comparison.
 * Optional risk filters (falling-knife / abnormal price-volume spike) so you can measure whether they help.
 * An "Engine audit" tab with hand-checkable self-tests.
+
+New in v3.1
+-----------
+* One-click stock lists (India 45-stock large-cap sample, US 20-stock sample) and a "not loaded" report.
+* "Compare setups" tab: tries 36 rule/risk combinations, picks the winner using IN-SAMPLE data only,
+  and then shows how that winner did on the unseen out-of-sample period.
 """
 
+import itertools
 from datetime import date, timedelta
 
 import numpy as np
@@ -149,6 +156,23 @@ def classify(last):
 
 SETUPS = ["Trend pullback", "20-day breakout"]
 
+# Sample lists. First 31 India names were confirmed in the NSE Nifty 50 constituent list (Aug 2026);
+# the last 14 are large, long-listed companies that were NOT confirmed against that list.
+# Using today's large caps for a long backtest has SURVIVORSHIP BIAS (past losers that dropped out are missing).
+INDIA_LARGE_CAPS = [
+    "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS", "BAJAJ-AUTO.NS",
+    "BAJAJFINSV.NS", "BAJFINANCE.NS", "BEL.NS", "BHARTIARTL.NS", "CIPLA.NS", "COALINDIA.NS", "DRREDDY.NS",
+    "EICHERMOT.NS", "ETERNAL.NS", "GRASIM.NS", "HCLTECH.NS", "HDFCBANK.NS", "HDFCLIFE.NS", "HINDALCO.NS",
+    "HINDUNILVR.NS", "ICICIBANK.NS", "INDIGO.NS", "INFY.NS", "ITC.NS", "JIOFIN.NS", "JSWSTEEL.NS",
+    "KOTAKBANK.NS", "LT.NS", "M&M.NS", "MARUTI.NS",
+    "RELIANCE.NS", "TCS.NS", "SBIN.NS", "SUNPHARMA.NS", "TITAN.NS", "ULTRACEMCO.NS", "NTPC.NS", "POWERGRID.NS",
+    "ONGC.NS", "TATASTEEL.NS", "WIPRO.NS", "NESTLEIND.NS", "TECHM.NS", "TATACONSUM.NS",
+]
+US_LARGE_CAPS = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "V", "JNJ", "WMT",
+    "PG", "XOM", "HD", "KO", "PEP", "COST", "MRK", "ABBV", "CSCO", "ORCL",
+]
+
 
 def risk_flags(d):
     """Boolean Series: True where a falling-knife or abnormal price/volume spike condition exists."""
@@ -258,8 +282,8 @@ def simulate_swing(o, h, l, c, sig, atr, p):
     return trades, ret, held
 
 
-def run_symbol(df, setup, p):
-    d = add_indicators(df)
+def run_symbol(d, setup, p):
+    """d must already have indicators (output of add_indicators)."""
     valid = d.index[d["SMA200"].notna()]
     if len(valid) < 60:
         return None
@@ -287,6 +311,55 @@ def run_symbol(df, setup, p):
         compounded_daily = float(np.prod(1 + ret))
         reconciles = bool(np.isclose(compounded_trades, compounded_daily, rtol=1e-9, atol=1e-12))
     return {"d": d, "signal": sig, "trades": tdf, "ret": ret_s, "held": held_s, "bh": bh, "reconciles": reconciles}
+
+
+def aggregate(results):
+    """Combine per-stock results into equal-sleeve portfolio series and one pooled trade table."""
+    port_ret = pd.DataFrame({s: r["ret"] for s, r in results.items()}).mean(axis=1, skipna=True)
+    port_held = pd.DataFrame({s: r["held"] for s, r in results.items()}).mean(axis=1, skipna=True)
+    port_bh = pd.DataFrame({s: r["bh"] for s, r in results.items()}).mean(axis=1, skipna=True)
+    parts = [r["trades"].assign(Symbol=s) for s, r in results.items() if len(r["trades"])]
+    all_trades = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Symbol", "NetReturn", "EntryDate"])
+    return port_ret, port_held, port_bh, all_trades
+
+
+def split_date_for(idx, split_pct):
+    return idx[min(int(len(idx) * split_pct / 100), len(idx) - 1)]
+
+
+GRID_STOPS = [1.5, 2.0, 3.0]
+GRID_RRS = [1.5, 2.0, 3.0]
+
+
+def run_grid(enriched, p, split_pct, progress=None):
+    """Try every setup x risk-filter x stop x reward:risk combination and report in-sample and out-of-sample stats."""
+    combos = list(itertools.product(SETUPS, [True, False], GRID_STOPS, GRID_RRS))
+    rows = []
+    for k, (setup, rf, sa, rr_) in enumerate(combos):
+        pp = {**p, "risk_filters": rf, "stop_atr": sa, "rr": rr_}
+        res = {}
+        for sym, d in enriched.items():
+            r = run_symbol(d, setup, pp)
+            if r is not None:
+                res[sym] = r
+        if res:
+            port_ret, port_held, port_bh, all_trades = aggregate(res)
+            idx = port_ret.index
+            split = split_date_for(idx, split_pct)
+            far = idx[-1] + pd.Timedelta(days=1)
+            ins = segment_report(port_ret, port_held, all_trades, port_bh, None, idx[0], split) or {}
+            oos = segment_report(port_ret, port_held, all_trades, port_bh, None, split, far) or {}
+            rows.append({
+                "Setup": setup, "Risk filters": "ON" if rf else "OFF", "Stop (xATR)": sa, "Reward:risk": rr_,
+                "IS trades": ins.get("Trades", 0), "IS expectancy": ins.get("Expectancy / trade", np.nan),
+                "IS profit factor": ins.get("Profit factor", np.nan),
+                "OOS trades": oos.get("Trades", 0), "OOS expectancy": oos.get("Expectancy / trade", np.nan),
+                "OOS profit factor": oos.get("Profit factor", np.nan),
+                "OOS return": oos.get("Strategy return", np.nan), "OOS buy & hold": oos.get("Buy & hold", np.nan),
+            })
+        if progress is not None:
+            progress.progress((k + 1) / len(combos), text=f"Tested {k + 1} of {len(combos)} combinations")
+    return pd.DataFrame(rows)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -451,7 +524,7 @@ def build_verdict(oos):
 # ----------------------------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Stock Research Lab", page_icon="📈", layout="wide")
-    st.title("📈 Stock Research Lab v3")
+    st.title("📈 Stock Research Lab v3.1")
     st.caption("India-first swing-trading research: transparent signals, risk checks, and an audited backtester")
     st.warning(
         "Research prototype only — not investment advice. No signal guarantees profits. "
@@ -461,9 +534,17 @@ def main():
     with st.sidebar:
         st.header("Data")
         market = st.selectbox("Market", ["India", "USA"])
-        defaults = "RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ICICIBANK.NS" if market == "India" else "AAPL,MSFT,NVDA,AMZN,GOOGL"
-        symbols_text = st.text_area("Symbols (comma separated)", defaults)
-        symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
+        preset_list = INDIA_LARGE_CAPS if market == "India" else US_LARGE_CAPS
+        preset_name = f"{market} large-cap sample ({len(preset_list)} stocks)"
+        list_choice = st.selectbox("Stock list", [preset_name, "Custom (type symbols)"])
+        if list_choice == "Custom (type symbols)":
+            defaults = "RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ICICIBANK.NS" if market == "India" else "AAPL,MSFT,NVDA,AMZN,GOOGL"
+            symbols_text = st.text_area("Symbols (comma separated)", defaults)
+            symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
+        else:
+            symbols = list(preset_list)
+            st.caption("Today's large caps only. Past index members that fell out or were delisted are missing, "
+                       "which makes historical results look better than they really were (survivorship bias).")
         today = date.today()
         start_date = st.date_input("Start date", value=today - timedelta(days=365 * 10), max_value=today)
         end_date = st.date_input("End date (exclusive)", value=today, max_value=today)
@@ -491,8 +572,8 @@ def main():
     p = {"rsi_entry": rsi_entry, "stop_atr": stop_atr, "rr": rr, "max_hold": max_hold,
          "risk_filters": risk_filters, "fee": fee_bps / 1e4, "slip": slip_bps / 1e4}
 
-    overview, chart_tab, bt_tab, risk_tab, valuation_tab, audit_tab = st.tabs(
-        ["Dashboard", "Stock chart", "Swing backtest", "Risk checks", "Valuation", "Engine audit"]
+    overview, chart_tab, bt_tab, compare_tab, risk_tab, valuation_tab, audit_tab = st.tabs(
+        ["Dashboard", "Stock chart", "Swing backtest", "Compare setups", "Risk checks", "Valuation", "Engine audit"]
     )
 
     prices, err = {}, None
@@ -542,6 +623,11 @@ def main():
         return
 
     enriched = {sym: add_indicators(df) for sym, df in prices.items()}
+    if uploaded is None:
+        missing = [s for s in symbols if s not in prices]
+        if missing:
+            st.warning(f"{len(missing)} of {len(symbols)} symbols did not load (symbol changed, delisted, or the free "
+                       f"data source failed): {', '.join(missing)}. Results use only the {len(prices)} that loaded.")
 
     # ---- Dashboard -----------------------------------------------------------------------------
     rows = []
@@ -579,8 +665,8 @@ def main():
 
     # ---- Run backtests ---------------------------------------------------------------------------
     results = {}
-    for sym, df in prices.items():
-        res = run_symbol(df, setup, p)
+    for sym, d_ in enriched.items():
+        res = run_symbol(d_, setup, p)
         if res is not None:
             results[sym] = res
 
@@ -615,15 +701,7 @@ def main():
         if not results:
             st.info("Not enough history (need roughly 260+ daily bars per stock) to run the swing backtest.")
         else:
-            ret_df = pd.DataFrame({s: r["ret"] for s, r in results.items()})
-            held_df = pd.DataFrame({s: r["held"] for s, r in results.items()})
-            bh_df = pd.DataFrame({s: r["bh"] for s, r in results.items()})
-            port_ret = ret_df.mean(axis=1, skipna=True)
-            port_held = held_df.mean(axis=1, skipna=True)
-            port_bh = bh_df.mean(axis=1, skipna=True)
-            all_trades = pd.concat(
-                [r["trades"].assign(Symbol=s) for s, r in results.items() if len(r["trades"])], ignore_index=True
-            ) if any(len(r["trades"]) for r in results.values()) else pd.DataFrame(columns=["Symbol", "NetReturn", "EntryDate"])
+            port_ret, port_held, port_bh, all_trades = aggregate(results)
 
             bench_ret = None
             if bench_symbol and uploaded is None:
@@ -637,7 +715,7 @@ def main():
                 st.caption(f"Benchmark {bench_symbol} could not be loaded; benchmark rows are blank.")
 
             idx = port_ret.index
-            split_date = idx[min(int(len(idx) * split_pct / 100), len(idx) - 1)]
+            split_date = split_date_for(idx, split_pct)
             far_future = idx[-1] + pd.Timedelta(days=1)
             segments = {
                 f"In-sample (to {split_date.date()})": (idx[0], split_date),
@@ -666,6 +744,8 @@ def main():
                     row[name] = f(rep[key]) if rep and key in rep else "—"
                 table.append(row)
             show_df(pd.DataFrame(table))
+            if list_choice != "Custom (type symbols)":
+                st.caption(f"Stocks tested: {len(results)}. Survivorship bias applies: this is today's list of large caps.")
             st.caption("Equal sleeves: each stock gets an equal slice of capital; a slice sits idle in cash (0% return) while "
                        "its stock has no open trade. Taxes beyond the cost setting, dividends reinvestment details and "
                        "position-size limits are not modelled.")
@@ -744,6 +824,62 @@ def main():
                 st.download_button("Download trade log", shown.to_csv(index=False).encode("utf-8"), "swing_trade_log.csv", "text/csv")
             else:
                 st.info("No trades were generated with these settings.")
+
+    # ---- Compare setups ------------------------------------------------------------------------
+    with compare_tab:
+        st.subheader("Compare setups — without fooling yourself")
+        n_combos = len(SETUPS) * 2 * len(GRID_STOPS) * len(GRID_RRS)
+        st.write(
+            f"This tries {n_combos} combinations (2 setups × risk filter on/off × {len(GRID_STOPS)} stop distances × "
+            f"{len(GRID_RRS)} reward:risk ratios) using your sidebar costs, holding limit and in-sample split. "
+            "The 'winner' is chosen from **in-sample numbers only**. What counts is how that winner did on the "
+            "**out-of-sample** period it never saw. With many combinations, an impressive in-sample winner is often luck."
+        )
+        sig_now = (tuple(sorted(enriched.keys())), str(start_date), str(end_date), fee_bps, slip_bps, max_hold, split_pct)
+        if st.button(f"Run comparison ({n_combos} combinations)"):
+            bar = st.progress(0.0, text="Starting…")
+            grid_df = run_grid(enriched, p, split_pct, bar)
+            bar.empty()
+            st.session_state["grid"] = (sig_now, grid_df)
+        if "grid" in st.session_state:
+            sig_saved, grid_df = st.session_state["grid"]
+            if sig_saved != sig_now:
+                st.warning("Stock list, dates, costs, holding limit or split changed since this comparison was run. "
+                           "Run it again to refresh.")
+            elif grid_df.empty:
+                st.info("Not enough data to compare.")
+            else:
+                grid_df = grid_df.sort_values("IS expectancy", ascending=False).reset_index(drop=True)
+                cand = grid_df[grid_df["IS trades"] >= 30]
+                if cand.empty:
+                    st.warning("No combination has at least 30 in-sample trades, so none can be selected. "
+                               "Use a larger stock list or a longer history.")
+                else:
+                    best = cand.iloc[0]
+                    msg = (f"Selected on in-sample data only: **{best['Setup']}**, risk filters {best['Risk filters']}, "
+                           f"stop {best['Stop (xATR)']}×ATR, reward:risk {best['Reward:risk']}. "
+                           f"In-sample expectancy {fmt_pct(best['IS expectancy'], 2)} per trade ({int(best['IS trades'])} trades). "
+                           f"**Out-of-sample: {fmt_pct(best['OOS expectancy'], 2)} per trade over {int(best['OOS trades'])} trades, "
+                           f"profit factor {fmt_num(best['OOS profit factor'])}.**")
+                    if best["OOS trades"] < 30:
+                        st.warning(msg + " Too few out-of-sample trades to judge.")
+                    elif best["OOS expectancy"] > 0:
+                        st.success(msg + " Positive on unseen data. Encouraging, not proof: keep testing before any real money.")
+                    else:
+                        st.error(msg + " The in-sample winner did NOT hold up on unseen data. No edge demonstrated.")
+                    share = float((grid_df["OOS expectancy"] > 0).mean())
+                    st.caption(f"{share * 100:.0f}% of all {len(grid_df)} combinations had positive out-of-sample expectancy "
+                               "(after costs). If that share is small, a few positive rows are probably noise.")
+                show = grid_df.copy()
+                for c in ["IS expectancy", "OOS expectancy"]:
+                    show[c] = show[c].map(lambda x: fmt_pct(x, 2))
+                for c in ["OOS return", "OOS buy & hold"]:
+                    show[c] = show[c].map(fmt_pct)
+                for c in ["IS profit factor", "OOS profit factor"]:
+                    show[c] = show[c].map(fmt_num)
+                show_df(show)
+                st.download_button("Download comparison CSV", grid_df.to_csv(index=False).encode("utf-8"),
+                                   "setup_comparison.csv", "text/csv")
 
     # ---- Risk checks ---------------------------------------------------------------------------
     with risk_tab:
